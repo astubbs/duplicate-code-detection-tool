@@ -99,6 +99,59 @@ def to_absolute_path(paths):
     return [os.path.abspath(path) for path in paths]
 
 
+def compute_delta(pr_similarity, base_similarity):
+    """Compare PR results against base and find new/changed similarities."""
+    new_pairs = []
+    increased_pairs = []
+    for file_a in pr_similarity:
+        for file_b in pr_similarity[file_a]:
+            pr_val = pr_similarity[file_a][file_b]
+            if not isinstance(pr_val, (int, float)):
+                continue
+            base_val = 0
+            if file_a in base_similarity and file_b in base_similarity[file_a]:
+                bv = base_similarity[file_a][file_b]
+                base_val = bv if isinstance(bv, (int, float)) else 0
+            if base_val == 0 and pr_val > 0:
+                new_pairs.append((file_a, file_b, pr_val))
+            elif pr_val > base_val:
+                increased_pairs.append((file_a, file_b, base_val, pr_val))
+    return new_pairs, increased_pairs
+
+
+def delta_to_markdown(new_pairs, increased_pairs, max_increase):
+    """Generate markdown for the comparison section."""
+    md = ""
+    failed = False
+
+    if new_pairs:
+        md += "\n### :new: New file similarities introduced\n\n"
+        md += "| File A | File B | Similarity (%) |\n"
+        md += "|--------|--------|--:|\n"
+        for fa, fb, val in sorted(new_pairs, key=lambda x: -x[2])[:20]:
+            md += "| %s | %s | %.1f |\n" % (fa, fb, val)
+        if len(new_pairs) > 20:
+            md += "\n...and %d more\n" % (len(new_pairs) - 20)
+
+    if increased_pairs:
+        md += "\n### :small_red_triangle: Increased similarities\n\n"
+        md += "| File A | File B | Base (%) | PR (%) | Change |\n"
+        md += "|--------|--------|--:|--:|--:|\n"
+        for fa, fb, bv, pv in sorted(increased_pairs, key=lambda x: -(x[3] - x[2]))[:20]:
+            change = pv - bv
+            status = " :x:" if change > max_increase else ""
+            md += "| %s | %s | %.1f | %.1f | +%.1f%s |\n" % (fa, fb, bv, pv, change, status)
+            if change > max_increase:
+                failed = True
+        if len(increased_pairs) > 20:
+            md += "\n...and %d more\n" % (len(increased_pairs) - 20)
+
+    if not new_pairs and not increased_pairs:
+        md += "\n:white_check_mark: No new or increased file similarities introduced by this PR.\n"
+
+    return md, failed
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Duplicate code detection action runner"
@@ -111,6 +164,17 @@ def main():
     )
     parser.add_argument(
         "--pull-request-id", type=str, required=True, help="The pull request id"
+    )
+    parser.add_argument(
+        "--json-only",
+        action="store_true",
+        help="Only output JSON results (for base branch scanning)",
+    )
+    parser.add_argument(
+        "--base-results",
+        type=str,
+        default="",
+        help="Path to base branch JSON results for comparison",
     )
     args = parser.parse_args()
 
@@ -160,6 +224,12 @@ def main():
             "Action failed due to maximum similarity threshold exceeded, check the report"
         )
 
+    # If json-only mode, just output the results and exit
+    if args.json_only:
+        import json
+        print(json.dumps(code_similarity))
+        return detection_result.value
+
     repo = os.environ.get("GITHUB_REPOSITORY")
     files_url_prefix = "https://github.com/%s/blob/%s/" % (repo, args.latest_head)
     warn_threshold = os.environ.get("INPUT_WARN_ABOVE")
@@ -169,9 +239,24 @@ def main():
     message += "The [tool](https://github.com/platisd/duplicate-code-detection-tool)"
     message += " analyzed your source code and found the following degree of"
     message += " similarity between the files:\n"
+
+    # Add base-vs-PR comparison if base results are available
+    if args.base_results and os.path.exists(args.base_results):
+        import json
+        with open(args.base_results, "r") as f:
+            base_similarity = json.load(f)
+        max_increase = float(os.environ.get("INPUT_MAX_INCREASE", 100))
+        new_pairs, increased_pairs = compute_delta(code_similarity, base_similarity)
+        delta_md, delta_failed = delta_to_markdown(new_pairs, increased_pairs, max_increase)
+        message += delta_md
+        if delta_failed:
+            detection_result = duplicate_code_detection.ReturnCode.THRESHOLD_EXCEEDED
+
+    message += "\n<details><summary>Full similarity report</summary>\n\n"
     message += similarities_to_markdown(
         code_similarity, files_url_prefix, warn_threshold
     )
+    message += "\n</details>\n"
 
     github_token = os.environ.get("INPUT_GITHUB_TOKEN")
     github_api_url = os.environ.get("GITHUB_API_URL")

@@ -39,6 +39,18 @@ inputs:
     description: 'Duplication report will be left as a single comment, which will be updated, instead of multiple ones'
     required: false
     default: false
+  compare_with_base:
+    description: 'Compare PR results against the base branch and report the delta. Shows new similarities introduced by the PR.'
+    required: false
+    default: false
+  base_ref:
+    description: 'The base branch or commit to compare against (only used when compare_with_base is true). Defaults to the PR base branch.'
+    required: false
+    default: ''
+  max_increase:
+    description: 'The maximum allowed increase in similarity percentage for any file pair before the action fails (only used when compare_with_base is true). Set to 0 to disallow any increase.'
+    required: false
+    default: 100
   header_message_start:
     description: 'The message to be displayed at the start of the duplication report.
                   It is used by the bot to identify previous reports and update them, so it must be unique.
