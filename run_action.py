@@ -197,7 +197,7 @@ def main():
 
     files_list = None
     ignore_files_list = None
-    json_output = True
+    json_output = False  # We handle output ourselves, don't let the engine print JSON
     csv_output_path = ""  # No CSV output by default for now in GitHub Actions
     show_loc = False
 
