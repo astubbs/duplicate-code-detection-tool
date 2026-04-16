@@ -197,9 +197,29 @@ def main():
 
     files_list = None
     ignore_files_list = None
-    json_output = False  # We handle output ourselves, don't let the engine print JSON
+    # Suppress the engine's text output only when --json-only (where we must
+    # have clean stdout). In normal mode we want logs in the CI output.
+    json_output = args.json_only
     csv_output_path = ""  # No CSV output by default for now in GitHub Actions
     show_loc = False
+
+    # When --json-only, redirect the engine's own JSON print to stderr so
+    # we can emit our own clean JSON on stdout
+    import io
+    stdout_capture = None
+    if args.json_only:
+        stdout_capture = io.StringIO()
+        import contextlib
+        @contextlib.contextmanager
+        def silence_stdout():
+            old = sys.stdout
+            sys.stdout = stdout_capture
+            try:
+                yield
+            finally:
+                sys.stdout = old
+        ctx = silence_stdout()
+        ctx.__enter__()
 
     detection_result, code_similarity = duplicate_code_detection.run(
         int(fail_threshold),
@@ -224,8 +244,9 @@ def main():
             "Action failed due to maximum similarity threshold exceeded, check the report"
         )
 
-    # If json-only mode, just output the results and exit
+    # If json-only mode, restore stdout and output the results as clean JSON
     if args.json_only:
+        ctx.__exit__(None, None, None)
         import json
         print(json.dumps(code_similarity))
         return detection_result.value
