@@ -2,7 +2,9 @@
 
 import os
 import sys
+import io
 import json
+import contextlib
 import requests
 import argparse
 
@@ -100,14 +102,24 @@ def to_absolute_path(paths):
 
 
 def compute_delta(pr_similarity, base_similarity):
-    """Compare PR results against base and find new/changed similarities."""
+    """Compare PR results against base and find new/changed similarities.
+
+    The engine emits a symmetric matrix (both ``[A][B]`` and ``[B][A]``), so each
+    file pair is deduplicated to a single unordered entry to avoid double-counting
+    it in the report.
+    """
     new_pairs = []
     increased_pairs = []
+    seen = set()
     for file_a in pr_similarity:
         for file_b in pr_similarity[file_a]:
             pr_val = pr_similarity[file_a][file_b]
             if not isinstance(pr_val, (int, float)):
                 continue
+            pair_key = tuple(sorted((file_a, file_b)))
+            if pair_key in seen:
+                continue
+            seen.add(pair_key)
             base_val = 0
             if file_a in base_similarity and file_b in base_similarity[file_a]:
                 bv = base_similarity[file_a][file_b]
@@ -154,7 +166,9 @@ def delta_to_markdown(new_pairs, increased_pairs, max_increase, fail_above):
         md += "| File A | File B | Base (%) | PR (%) | Change |\n"
         md += "|--------|--------|--:|--:|--:|\n"
         for fa, fb, bv, pv in sorted(increased_pairs, key=lambda x: -(x[3] - x[2]))[:20]:
-            change = pv - bv
+            # Round to the inputs' precision so binary-float subtraction noise can't
+            # push an increase that equals max_increase over the strict-> boundary.
+            change = round(pv - bv, 2)
             status = " :x:" if change > max_increase else ""
             md += "| %s | %s | %.1f | %.1f | +%.1f%s |\n" % (fa, fb, bv, pv, change, status)
             if change > max_increase:
@@ -219,62 +233,44 @@ def main():
     csv_output_path = ""  # No CSV output by default for now in GitHub Actions
     show_loc = False
 
-    # When --json-only, redirect the engine's own JSON print to stderr so
-    # we can emit our own clean JSON on stdout
-    import io
-    stdout_capture = None
-    if args.json_only:
-        stdout_capture = io.StringIO()
-        import contextlib
-        @contextlib.contextmanager
-        def silence_stdout():
-            old = sys.stdout
-            sys.stdout = stdout_capture
-            try:
-                yield
-            finally:
-                sys.stdout = old
-        ctx = silence_stdout()
-        ctx.__enter__()
-
-    detection_result, code_similarity = duplicate_code_detection.run(
-        int(fail_threshold),
-        directories_list,
-        files_list,
-        ignore_directories_list,
-        ignore_files_list,
-        json_output,
-        project_root_dir,
-        file_extensions_list,
-        int(ignore_threshold),
-        bool(only_code),
-        csv_output_path,
-        show_loc,
+    # In --json-only mode we must emit ONLY clean JSON on stdout, so capture the
+    # engine's own console output. contextlib.redirect_stdout restores stdout even
+    # if run() raises; a manual __enter__/__exit__ would leak the redirect and
+    # corrupt stdout for every later in-process call (e.g. the test suite).
+    stdout_capture = io.StringIO()
+    capture = (
+        contextlib.redirect_stdout(stdout_capture)
+        if args.json_only
+        else contextlib.nullcontext()
     )
-
-    if detection_result == duplicate_code_detection.ReturnCode.BAD_INPUT:
-        # Restore real stdout first in --json-only mode, otherwise the message is
-        # swallowed by the capture buffer and stdout is left dangling on early return.
-        if args.json_only:
-            ctx.__exit__(None, None, None)
-        print("Action aborted due to bad user input")
-        return detection_result.value
-    elif detection_result == duplicate_code_detection.ReturnCode.THRESHOLD_EXCEEDED:
-        print(
-            "Action failed due to maximum similarity threshold exceeded, check the report"
+    with capture:
+        detection_result, code_similarity = duplicate_code_detection.run(
+            int(fail_threshold),
+            directories_list,
+            files_list,
+            ignore_directories_list,
+            ignore_files_list,
+            json_output,
+            project_root_dir,
+            file_extensions_list,
+            int(ignore_threshold),
+            bool(only_code),
+            csv_output_path,
+            show_loc,
         )
 
-    # If json-only mode, restore stdout and output the results as clean JSON
+    if detection_result == duplicate_code_detection.ReturnCode.BAD_INPUT:
+        print("Action aborted due to bad user input")
+        return detection_result.value
+
+    # --json-only is a data dump used to capture the BASE branch's similarity for
+    # later comparison. A successful scan must exit 0 even when the base already
+    # exceeds fail_above (which is exactly when comparison matters) - otherwise
+    # entrypoint.sh reads the non-zero exit as "base scan failed", throws the base
+    # data away, and the PR gets gated on absolute similarity. A genuine BAD_INPUT
+    # has already returned non-zero above.
     if args.json_only:
-        ctx.__exit__(None, None, None)
-        import json
         print(json.dumps(code_similarity))
-        # --json-only is a data dump used to capture the BASE branch's similarity
-        # for later comparison. A successful scan must exit 0 even when the base
-        # already exceeds fail_above (which is exactly when comparison matters) -
-        # otherwise entrypoint.sh reads the non-zero exit as "base scan failed",
-        # throws the base data away, and the PR gets gated on absolute similarity.
-        # A genuine BAD_INPUT has already returned non-zero above.
         return duplicate_code_detection.ReturnCode.SUCCESS.value
 
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -289,24 +285,41 @@ def main():
 
     # Add base-vs-PR comparison if base results are available
     if args.base_results and os.path.exists(args.base_results):
-        import json
-        with open(args.base_results, "r") as f:
-            base_similarity = json.load(f)
-        max_increase = float(os.environ.get("INPUT_MAX_INCREASE", 100))
-        new_pairs, increased_pairs = compute_delta(code_similarity, base_similarity)
-        delta_md, delta_failed = delta_to_markdown(
-            new_pairs, increased_pairs, max_increase, int(fail_threshold)
-        )
-        message += delta_md
-        # In comparison mode the DELTA is the gate, not the absolute pre-existing
-        # similarity. Overwrite (not just elevate) the verdict: a PR that adds no
-        # new/increased duplication passes even if the codebase already sits above
-        # fail_above; a PR that introduces a new pair above fail_above, or pushes an
-        # existing pair past max_increase, fails.
-        detection_result = (
-            duplicate_code_detection.ReturnCode.THRESHOLD_EXCEEDED
-            if delta_failed
-            else duplicate_code_detection.ReturnCode.SUCCESS
+        base_similarity = None
+        try:
+            with open(args.base_results, "r") as f:
+                base_similarity = json.load(f)
+        except (OSError, ValueError) as err:
+            # A corrupt/truncated base file must not crash the whole action - the
+            # base scan itself was made fault-tolerant, so match that: degrade to
+            # absolute-threshold gating (the pre-comparison verdict) with a warning.
+            print(
+                "Warning: could not read base results '%s' (%s); "
+                "falling back to absolute-threshold gating" % (args.base_results, err)
+            )
+        if base_similarity is not None:
+            max_increase = float(os.environ.get("INPUT_MAX_INCREASE", 100))
+            new_pairs, increased_pairs = compute_delta(code_similarity, base_similarity)
+            delta_md, delta_failed = delta_to_markdown(
+                new_pairs, increased_pairs, max_increase, int(fail_threshold)
+            )
+            message += delta_md
+            # In comparison mode the DELTA is the gate, not the absolute pre-existing
+            # similarity. Overwrite (not just elevate) the verdict: a PR that adds no
+            # new/increased duplication passes even if the codebase already sits above
+            # fail_above; a PR that introduces a new pair above fail_above, or pushes an
+            # existing pair past max_increase, fails.
+            detection_result = (
+                duplicate_code_detection.ReturnCode.THRESHOLD_EXCEEDED
+                if delta_failed
+                else duplicate_code_detection.ReturnCode.SUCCESS
+            )
+
+    # Announce failure based on the FINAL verdict (after any comparison override),
+    # so the CI log never contradicts the exit code.
+    if detection_result == duplicate_code_detection.ReturnCode.THRESHOLD_EXCEEDED:
+        print(
+            "Action failed due to maximum similarity threshold exceeded, check the report"
         )
 
     message += "\n<details><summary>Full similarity report</summary>\n\n"
