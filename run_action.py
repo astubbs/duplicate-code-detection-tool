@@ -249,7 +249,13 @@ def main():
         ctx.__exit__(None, None, None)
         import json
         print(json.dumps(code_similarity))
-        return detection_result.value
+        # --json-only is a data dump used to capture the BASE branch's similarity
+        # for later comparison. A successful scan must exit 0 even when the base
+        # already exceeds fail_above (which is exactly when comparison matters) -
+        # otherwise entrypoint.sh reads the non-zero exit as "base scan failed",
+        # throws the base data away, and the PR gets gated on absolute similarity.
+        # A genuine BAD_INPUT has already returned non-zero above.
+        return duplicate_code_detection.ReturnCode.SUCCESS.value
 
     repo = os.environ.get("GITHUB_REPOSITORY")
     files_url_prefix = "https://github.com/%s/blob/%s/" % (repo, args.latest_head)
@@ -270,8 +276,15 @@ def main():
         new_pairs, increased_pairs = compute_delta(code_similarity, base_similarity)
         delta_md, delta_failed = delta_to_markdown(new_pairs, increased_pairs, max_increase)
         message += delta_md
-        if delta_failed:
-            detection_result = duplicate_code_detection.ReturnCode.THRESHOLD_EXCEEDED
+        # In comparison mode the DELTA is the gate, not the absolute pre-existing
+        # similarity. Overwrite (not just elevate) the verdict: a PR that adds no
+        # new/increased duplication passes even if the codebase already sits above
+        # fail_above; a PR that pushes a pair past max_increase fails.
+        detection_result = (
+            duplicate_code_detection.ReturnCode.THRESHOLD_EXCEEDED
+            if delta_failed
+            else duplicate_code_detection.ReturnCode.SUCCESS
+        )
 
     message += "\n<details><summary>Full similarity report</summary>\n\n"
     message += similarities_to_markdown(
