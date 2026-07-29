@@ -12,6 +12,7 @@ import os
 import sys
 import json
 import types
+import shutil
 import unittest
 import contextlib
 
@@ -38,10 +39,23 @@ PRE_EXISTING = {"a.java": {"b.java": 90.0}, "b.java": {"a.java": 90.0}}
 
 
 def _fake_requests():
+    """Fake `requests` that records the posted/patched comment bodies so tests can
+    assert on the actual report content, not just the return code."""
+    posted = []
+
+    def _post(url, json=None, headers=None):
+        posted.append(json.get("body") if json else None)
+        return types.SimpleNamespace(status_code=201, text="")
+
+    def _patch(url, json=None, headers=None):
+        posted.append(json.get("body") if json else None)
+        return types.SimpleNamespace(status_code=200, text="")
+
     m = types.SimpleNamespace()
     m.get = lambda *a, **k: types.SimpleNamespace(json=lambda: [], status_code=200)
-    m.post = lambda *a, **k: types.SimpleNamespace(status_code=201, text="")
-    m.patch = lambda *a, **k: types.SimpleNamespace(status_code=200, text="")
+    m.post = _post
+    m.patch = _patch
+    m.posted = posted
     return m
 
 
@@ -72,7 +86,8 @@ class CompareWithBaseTest(unittest.TestCase):
         })
         self._orig_run = duplicate_code_detection.run
         self._orig_requests = run_action.requests
-        run_action.requests = _fake_requests()
+        self._requests = _fake_requests()
+        run_action.requests = self._requests
 
     def tearDown(self):
         duplicate_code_detection.run = self._orig_run
@@ -80,6 +95,10 @@ class CompareWithBaseTest(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self._env)
         os.chdir(self._cwd)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _last_body(self):
+        return self._requests.posted[-1] if self._requests.posted else ""
 
     def _run(self, argv, engine_result):
         """Drive run_action.main() with a mocked engine, return (rc, stdout)."""
@@ -124,13 +143,16 @@ class CompareWithBaseTest(unittest.TestCase):
 
     def test_pr_scan_passes_when_no_new_duplication(self):
         """Base == PR: pre-existing 90% similarity, nothing new introduced.
-        Must PASS despite being above the absolute fail_above."""
+        Must PASS despite being above the absolute fail_above, and the CI log must
+        NOT print the failure banner (it reflects the post-comparison verdict)."""
         base = self._write_base(PRE_EXISTING)
-        rc, _ = self._run(
+        rc, out = self._run(
             ["run_action.py", "--pull-request-id", "1", "--base-results", base],
             (RC.THRESHOLD_EXCEEDED, dict(PRE_EXISTING)),
         )
         self.assertEqual(rc, RC.SUCCESS.value)
+        self.assertNotIn("Action failed", out)  # log must match the SUCCESS verdict
+        self.assertIn("No new or increased", self._last_body())
 
     def test_pr_scan_fails_when_similarity_increases_beyond_max(self):
         """A real regression: a pair jumps from 70% (base) to 90% (PR), a +20
@@ -147,11 +169,15 @@ class CompareWithBaseTest(unittest.TestCase):
         90% > fail_above=80) is newly-introduced duplication and must FAIL -
         even though it is 'new', not an 'increase' of an existing pair."""
         base = self._write_base({})  # neither file exists on base
-        rc, _ = self._run(
+        rc, out = self._run(
             ["run_action.py", "--pull-request-id", "1", "--base-results", base],
             (RC.THRESHOLD_EXCEEDED, dict(PRE_EXISTING)),  # a.java/b.java = 90
         )
         self.assertEqual(rc, RC.THRESHOLD_EXCEEDED.value)
+        self.assertIn("Action failed", out)  # log matches the FAIL verdict
+        body = self._last_body()
+        self.assertIn("New file similarities introduced", body)
+        self.assertIn(":x:", body)  # the new pair is flagged as failing
 
     def test_pr_scan_passes_when_new_pair_below_fail_above(self):
         """A brand-new pair below fail_above (50% < 80%) is not duplication worth
@@ -171,6 +197,50 @@ class CompareWithBaseTest(unittest.TestCase):
             (RC.THRESHOLD_EXCEEDED, dict(PRE_EXISTING)),
         )
         self.assertEqual(rc, RC.THRESHOLD_EXCEEDED.value)
+
+    def test_new_pair_exactly_at_fail_above_passes(self):
+        """Boundary: a new pair exactly AT fail_above (80) must PASS - the gate is
+        strict `> fail_above`, so equality is not a failure."""
+        base = self._write_base({})
+        rc, _ = self._run(
+            ["run_action.py", "--pull-request-id", "1", "--base-results", base],
+            (RC.SUCCESS, {"a.java": {"b.java": 80.0}, "b.java": {"a.java": 80.0}}),
+        )
+        self.assertEqual(rc, RC.SUCCESS.value)
+
+    def test_increase_exactly_at_max_increase_passes_despite_float_noise(self):
+        """Boundary + float noise: an increase of exactly max_increase (10) must
+        PASS. 80.01 - 70.01 is 10.000000000000014 in binary float; rounding keeps
+        it at the boundary so it does not spuriously fail."""
+        base = self._write_base({"a.java": {"b.java": 70.01}, "b.java": {"a.java": 70.01}})
+        rc, _ = self._run(
+            ["run_action.py", "--pull-request-id", "1", "--base-results", base],
+            (RC.SUCCESS, {"a.java": {"b.java": 80.01}, "b.java": {"a.java": 80.01}}),
+        )
+        self.assertEqual(rc, RC.SUCCESS.value)
+
+    def test_corrupt_base_results_degrades_to_absolute_without_crashing(self):
+        """A truncated/corrupt base-results file must NOT crash the action; it
+        degrades to absolute-threshold gating (the engine's raw verdict) with a
+        warning, matching the base-scan's own fault tolerance."""
+        path = os.path.join(self._tmp, "base_results.json")
+        with open(path, "w") as f:
+            f.write('{"a.java": {"b.java": 90.0}')  # truncated JSON
+        rc, out = self._run(
+            ["run_action.py", "--pull-request-id", "1", "--base-results", path],
+            (RC.THRESHOLD_EXCEEDED, dict(PRE_EXISTING)),
+        )
+        self.assertEqual(rc, RC.THRESHOLD_EXCEEDED.value)  # fell back to absolute
+        self.assertIn("falling back to absolute-threshold gating", out)
+
+    def test_compute_delta_dedupes_symmetric_pairs(self):
+        """The engine emits both (A,B) and (B,A); compute_delta must count the
+        unordered pair once, not twice, in the report."""
+        new_pairs, increased = run_action.compute_delta(
+            {"a.java": {"b.java": 99.0}, "b.java": {"a.java": 99.0}}, {}
+        )
+        self.assertEqual(len(new_pairs), 1)
+        self.assertEqual(increased, [])
 
 
 if __name__ == "__main__":
