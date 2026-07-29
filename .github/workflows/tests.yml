@@ -1,0 +1,17 @@
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  unit-tests:
+    name: Python unit tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The tests stub out gensim/nltk/astor/requests and mock the engine + GitHub,
+      # so they need no third-party deps - keeps this job fast and hermetic.
+      - name: Run unit tests
+        run: python -m unittest test_run_action -v
