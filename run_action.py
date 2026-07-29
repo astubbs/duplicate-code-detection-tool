@@ -119,8 +119,21 @@ def compute_delta(pr_similarity, base_similarity):
     return new_pairs, increased_pairs
 
 
-def delta_to_markdown(new_pairs, increased_pairs, max_increase):
-    """Generate markdown for the comparison section."""
+def delta_to_markdown(new_pairs, increased_pairs, max_increase, fail_above):
+    """Generate markdown for the comparison section and decide pass/fail.
+
+    A PR fails when it INTRODUCES duplication, i.e.:
+      - a brand-new file pair whose similarity exceeds ``fail_above`` (newly
+        introduced duplication - e.g. a copy-pasted pair of files), or
+      - an existing pair whose similarity increased by more than ``max_increase``.
+    Pre-existing similarity that the PR did not change never fails.
+
+    Known limitation (path-keyed, no content tracking): renaming/moving one file of
+    a pre-existing similar pair makes it look like a brand-new pair, so it is judged
+    against ``fail_above`` rather than being recognised as pre-existing. And because
+    the gate is a per-pair delta, similarity can still creep up across many PRs that
+    each stay under ``max_increase``.
+    """
     md = ""
     failed = False
 
@@ -129,7 +142,10 @@ def delta_to_markdown(new_pairs, increased_pairs, max_increase):
         md += "| File A | File B | Similarity (%) |\n"
         md += "|--------|--------|--:|\n"
         for fa, fb, val in sorted(new_pairs, key=lambda x: -x[2])[:20]:
-            md += "| %s | %s | %.1f |\n" % (fa, fb, val)
+            status = " :x:" if val > fail_above else ""
+            md += "| %s | %s | %.1f%s |\n" % (fa, fb, val, status)
+            if val > fail_above:
+                failed = True
         if len(new_pairs) > 20:
             md += "\n...and %d more\n" % (len(new_pairs) - 20)
 
@@ -237,6 +253,10 @@ def main():
     )
 
     if detection_result == duplicate_code_detection.ReturnCode.BAD_INPUT:
+        # Restore real stdout first in --json-only mode, otherwise the message is
+        # swallowed by the capture buffer and stdout is left dangling on early return.
+        if args.json_only:
+            ctx.__exit__(None, None, None)
         print("Action aborted due to bad user input")
         return detection_result.value
     elif detection_result == duplicate_code_detection.ReturnCode.THRESHOLD_EXCEEDED:
@@ -274,12 +294,15 @@ def main():
             base_similarity = json.load(f)
         max_increase = float(os.environ.get("INPUT_MAX_INCREASE", 100))
         new_pairs, increased_pairs = compute_delta(code_similarity, base_similarity)
-        delta_md, delta_failed = delta_to_markdown(new_pairs, increased_pairs, max_increase)
+        delta_md, delta_failed = delta_to_markdown(
+            new_pairs, increased_pairs, max_increase, int(fail_threshold)
+        )
         message += delta_md
         # In comparison mode the DELTA is the gate, not the absolute pre-existing
         # similarity. Overwrite (not just elevate) the verdict: a PR that adds no
         # new/increased duplication passes even if the codebase already sits above
-        # fail_above; a PR that pushes a pair past max_increase fails.
+        # fail_above; a PR that introduces a new pair above fail_above, or pushes an
+        # existing pair past max_increase, fails.
         detection_result = (
             duplicate_code_detection.ReturnCode.THRESHOLD_EXCEEDED
             if delta_failed

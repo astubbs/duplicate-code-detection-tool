@@ -112,12 +112,15 @@ class CompareWithBaseTest(unittest.TestCase):
         self.assertEqual(json.loads(out), PRE_EXISTING)  # clean JSON on stdout
 
     def test_base_scan_json_only_propagates_bad_input(self):
-        """Genuine failures (bad input) must still surface as non-zero."""
-        rc, _ = self._run(
+        """Genuine failures (bad input) must still surface as non-zero, and must
+        restore stdout so the message is visible (not swallowed by the capture)."""
+        rc, out = self._run(
             ["run_action.py", "--pull-request-id", "1", "--json-only"],
             (RC.BAD_INPUT, {}),
         )
         self.assertEqual(rc, RC.BAD_INPUT.value)
+        # The message is only visible if stdout was restored before printing.
+        self.assertIn("bad user input", out)
 
     def test_pr_scan_passes_when_no_new_duplication(self):
         """Base == PR: pre-existing 90% similarity, nothing new introduced.
@@ -138,6 +141,27 @@ class CompareWithBaseTest(unittest.TestCase):
             (RC.THRESHOLD_EXCEEDED, dict(PRE_EXISTING)),
         )
         self.assertEqual(rc, RC.THRESHOLD_EXCEEDED.value)
+
+    def test_pr_scan_fails_when_new_pair_introduced_above_fail_above(self):
+        """A PR that introduces a brand-new highly-similar pair (absent from base,
+        90% > fail_above=80) is newly-introduced duplication and must FAIL -
+        even though it is 'new', not an 'increase' of an existing pair."""
+        base = self._write_base({})  # neither file exists on base
+        rc, _ = self._run(
+            ["run_action.py", "--pull-request-id", "1", "--base-results", base],
+            (RC.THRESHOLD_EXCEEDED, dict(PRE_EXISTING)),  # a.java/b.java = 90
+        )
+        self.assertEqual(rc, RC.THRESHOLD_EXCEEDED.value)
+
+    def test_pr_scan_passes_when_new_pair_below_fail_above(self):
+        """A brand-new pair below fail_above (50% < 80%) is not duplication worth
+        failing - it must PASS."""
+        base = self._write_base({})
+        rc, _ = self._run(
+            ["run_action.py", "--pull-request-id", "1", "--base-results", base],
+            (RC.SUCCESS, {"a.java": {"b.java": 50.0}, "b.java": {"a.java": 50.0}}),
+        )
+        self.assertEqual(rc, RC.SUCCESS.value)
 
     def test_pr_scan_without_base_still_gates_on_absolute(self):
         """When there is no base to compare against (comparison off/unavailable),
